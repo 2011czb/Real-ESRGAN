@@ -135,11 +135,11 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
     }
   }, [fileList, params, processingService, setResultImage, setProcessingTime, cancelling])
 
-  const handleCancel = useCallback(() => {
+  const handleCancel = useCallback(async () => {
     if (processingService.isProcessing()) {
       setCancelling(true)
       setProgressMessage('正在取消...')
-      const cancelled = processingService.cancelProcessing()
+      const cancelled = await processingService.cancelProcessing()
       if (cancelled) {
         message.info('已发送取消请求，正在清理内存...')
       } else {

@@ -33,6 +33,7 @@ class ProcessingService {
   private processingMode: 'local' | 'cloud' = 'local'
   private cloudEndpoints: Record<string, string> = {}
   private currentWebSocket: WebSocket | null = null
+  private currentTaskId: string | null = null
 
   constructor(baseURL: string = 'http://localhost:8000') {
     this.baseURL = baseURL
@@ -111,6 +112,7 @@ class ProcessingService {
     params: EnhanceParams = {},
     onProgress?: ProgressCallback
   ): Promise<EnhanceResult> {
+    this.currentTaskId = null
     return new Promise((resolve, reject) => {
       // 将文件转换为base64
       const reader = new FileReader()
@@ -145,6 +147,11 @@ class ProcessingService {
         ws.onmessage = (event) => {
           const data = JSON.parse(event.data)
 
+          if (data.type === 'task') {
+            this.currentTaskId = data.task_id || null
+            return
+          }
+
           if (data.type === 'progress') {
             // 进度更新
             if (onProgress) {
@@ -152,6 +159,7 @@ class ProcessingService {
             }
           } else if (data.type === 'result') {
             // 处理完成
+            this.currentTaskId = null
             this.currentWebSocket = null
             ws.close()
             resolve({
@@ -162,6 +170,7 @@ class ProcessingService {
             })
           } else if (data.type === 'cancelled') {
             // 处理已取消
+            this.currentTaskId = null
             this.currentWebSocket = null
             ws.close()
             resolve({
@@ -170,6 +179,7 @@ class ProcessingService {
             })
           } else if (data.type === 'error') {
             // 处理失败
+            this.currentTaskId = null
             this.currentWebSocket = null
             ws.close()
             reject(new Error(data.message))
@@ -178,12 +188,14 @@ class ProcessingService {
 
         ws.onerror = (error) => {
           this.currentWebSocket = null
+          this.currentTaskId = null
           ws.close()
           reject(error)
         }
 
         ws.onclose = () => {
           this.currentWebSocket = null
+          this.currentTaskId = null
           // 连接关闭
         }
       }
@@ -199,11 +211,16 @@ class ProcessingService {
   /**
    * 取消当前处理任务
    */
-  cancelProcessing(): boolean {
+  async cancelProcessing(): Promise<boolean> {
     if (this.currentWebSocket && this.currentWebSocket.readyState === WebSocket.OPEN) {
       try {
         // 发送文本消息（后端使用 receive_text 接收）
         this.currentWebSocket.send(JSON.stringify({ type: 'cancel' }))
+        if (this.currentTaskId) {
+          await axios.post(`${this.baseURL}/api/v1/tasks/${this.currentTaskId}/cancel`).catch((err) => {
+            console.error('HTTP取消请求失败:', err)
+          })
+        }
         return true
       } catch (error) {
         console.error('发送取消请求失败:', error)
@@ -226,6 +243,27 @@ class ProcessingService {
    */
   getMode(): 'local' | 'cloud' {
     return this.processingMode
+  }
+
+  /**
+   * 测试服务连通性
+   */
+  async testConnectivity(): Promise<{ ok: boolean; message: string }> {
+    try {
+      const response = await axios.get(`${this.baseURL}/api/v1/ping`, {
+        timeout: 5000,
+      })
+      const ok = response.data?.status === 'ok' || response.data?.status === 'healthy'
+      return {
+        ok,
+        message: response.data?.message || '云端服务可用',
+      }
+    } catch (error: any) {
+      return {
+        ok: false,
+        message: error.response?.data?.detail || error.message || '无法连接到服务',
+      }
+    }
   }
 }
 

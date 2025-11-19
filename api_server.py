@@ -629,6 +629,10 @@ async def enhance_image_stream(websocket: WebSocket):
     
     task_id = str(uuid.uuid4())
     task_cancelled[task_id] = False
+    await websocket.send_json({
+        "type": "task",
+        "task_id": task_id
+    })
     
     def check_cancelled():
         # 检查服务器是否正在关闭
@@ -815,6 +819,31 @@ async def set_cloud_endpoints(endpoints: dict):
     return {"status": "success", "endpoints": processing_service.cloud_endpoints}
 
 
+@app.get("/api/v1/ping")
+async def ping():
+    """连通性测试"""
+    device_info = processing_service._get_device_info()
+    return {
+        "status": "ok",
+        "mode": processing_service.mode,
+        "device": device_info,
+        "message": "云端服务在线，可接受任务"
+    }
+
+
+@app.post("/api/v1/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    """通过HTTP请求取消任务"""
+    existed = task_id in task_cancelled
+    task_cancelled[task_id] = True
+    return {
+        "status": "success",
+        "task_id": task_id,
+        "cancelled": True,
+        "message": "已通知服务器取消任务" if existed else "任务不存在或已完成，已忽略"
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     
@@ -822,7 +851,7 @@ if __name__ == "__main__":
     config = uvicorn.Config(
         app,
         host="0.0.0.0",
-        port=8000,
+        port=8080,
         log_level="info"
     )
     
