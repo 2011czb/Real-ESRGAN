@@ -14,7 +14,7 @@ const App: React.FC = () => {
   const [processingMode, setProcessingMode] = useState<'local' | 'cloud'>('local')
   const [isDarkMode, setIsDarkMode] = useState(false)
 
-  const localService = useState(() => new ProcessingService('http://localhost:8000'))[0]
+  const localService = useState(() => new ProcessingService('http://localhost:8080'))[0]
   const cloudService = useState(() => new ProcessingService('http://119.8.52.74:8080'))[0]
   const currentService = processingMode === 'local' ? localService : cloudService
 
