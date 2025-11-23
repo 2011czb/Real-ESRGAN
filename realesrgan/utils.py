@@ -114,7 +114,7 @@ class RealESRGANer():
         # model inference
         self.output = self.model(self.img)
 
-    def tile_process(self):
+    def tile_process(self, tile_progress_callback=None):
         """It will first crop input images to tiles, and then process each tile.
         Finally, all the processed tiles are merged into one images.
 
@@ -129,6 +129,8 @@ class RealESRGANer():
         self.output = self.img.new_zeros(output_shape)
         tiles_x = math.ceil(width / self.tile_size)
         tiles_y = math.ceil(height / self.tile_size)
+
+        total_tiles = tiles_x * tiles_y
 
         # loop over all tiles
         for y in range(tiles_y):
@@ -160,7 +162,17 @@ class RealESRGANer():
                         output_tile = self.model(input_tile)
                 except RuntimeError as error:
                     print('Error', error)
-                print(f'\tTile {tile_idx}/{tiles_x * tiles_y}')
+                    continue
+
+                print(f'\tTile {tile_idx}/{total_tiles}')
+
+                # 调用可选的 tile 级进度回调，便于上层通过 WebSocket 推送细粒度进度
+                if tile_progress_callback is not None:
+                    try:
+                        tile_progress_callback(tile_idx, total_tiles)
+                    except Exception:
+                        # 回调异常不应中断推理
+                        pass
 
                 # output tile area on total image
                 output_start_x = input_start_x * self.scale
@@ -191,7 +203,7 @@ class RealESRGANer():
         return self.output
 
     @torch.no_grad()
-    def enhance(self, img, outscale=None, alpha_upsampler='realesrgan'):
+    def enhance(self, img, outscale=None, alpha_upsampler='realesrgan', tile_progress_callback=None):
         h_input, w_input = img.shape[0:2]
         # img: numpy
         img = img.astype(np.float32)
@@ -218,7 +230,8 @@ class RealESRGANer():
         # ------------------- process image (without the alpha channel) ------------------- #
         self.pre_process(img)
         if self.tile_size > 0:
-            self.tile_process()
+            # 传递 tile_progress_callback 以便在每个 tile 完成时汇报进度
+            self.tile_process(tile_progress_callback=tile_progress_callback)
         else:
             self.process()
         output_img = self.post_process()
@@ -232,7 +245,7 @@ class RealESRGANer():
             if alpha_upsampler == 'realesrgan':
                 self.pre_process(alpha)
                 if self.tile_size > 0:
-                    self.tile_process()
+                    self.tile_process(tile_progress_callback=tile_progress_callback)
                 else:
                     self.process()
                 output_alpha = self.post_process()

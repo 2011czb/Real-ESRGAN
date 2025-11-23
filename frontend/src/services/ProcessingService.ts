@@ -20,6 +20,18 @@ export interface EnhanceResult {
   result_image?: string
   processing_time?: number
   image_mode?: string
+  // 后端时间拆分（秒）
+  pre_infer_time?: number
+  infer_time?: number
+  post_infer_time?: number
+  // 网络流量（字节）
+  input_size_bytes?: number
+  output_size_bytes?: number
+  // 资源占用（粗粒度）
+  cpu_percent?: number
+  process_mem_mb?: number
+  gpu_mem_allocated_mb?: number
+  gpu_mem_reserved_mb?: number
   error?: string
   cancelled?: boolean
 }
@@ -68,7 +80,8 @@ class ProcessingService {
    */
   async enhanceImage(
     file: File,
-    params: EnhanceParams = {}
+    params: EnhanceParams = {},
+    experimentConfig?: { networkProfile?: 'none' | 'low' | 'medium' | 'high' }
   ): Promise<EnhanceResult> {
     const formData = new FormData()
     formData.append('file', file)
@@ -83,6 +96,17 @@ class ProcessingService {
       formData.append('outscale', String(params.outscale))
     }
     formData.append('processing_mode', this.processingMode)
+
+    // 如果提供了实验配置，则序列化到 experiment 字段，用于后端延迟模拟等实验
+    if (experimentConfig) {
+      const payload: any = {}
+      if (experimentConfig.networkProfile && experimentConfig.networkProfile !== 'none') {
+        payload.networkProfile = experimentConfig.networkProfile
+      }
+      if (Object.keys(payload).length > 0) {
+        formData.append('experiment', JSON.stringify(payload))
+      }
+    }
 
     try {
       const response = await axios.post<EnhanceResult>(
@@ -167,6 +191,18 @@ class ProcessingService {
               result_image: data.result_image,
               processing_time: data.processing_time,
               image_mode: data.image_mode,
+              // 时间拆分（如果后端提供）
+              pre_infer_time: data.pre_infer_time,
+              infer_time: data.infer_time,
+              post_infer_time: data.post_infer_time,
+              // 网络流量
+              input_size_bytes: data.input_size_bytes,
+              output_size_bytes: data.output_size_bytes,
+              // 资源占用
+              cpu_percent: data.cpu_percent,
+              process_mem_mb: data.process_mem_mb,
+              gpu_mem_allocated_mb: data.gpu_mem_allocated_mb,
+              gpu_mem_reserved_mb: data.gpu_mem_reserved_mb,
             })
           } else if (data.type === 'cancelled') {
             // 处理已取消
@@ -234,7 +270,7 @@ class ProcessingService {
    * 检查是否有正在进行的任务
    */
   isProcessing(): boolean {
-    return this.currentWebSocket !== null && 
+    return this.currentWebSocket !== null &&
            this.currentWebSocket.readyState === WebSocket.OPEN
   }
 

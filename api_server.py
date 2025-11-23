@@ -15,6 +15,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import psutil
 import torch
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -269,7 +270,27 @@ class ProcessingService:
                         if task_id and check_cancelled and check_cancelled():
                             raise asyncio.CancelledError("任务已取消")
 
-                        output, _ = upsampler.enhance(img, outscale=params.outscale)
+                        # 定义 tile 级进度回调，将 RealESRGAN 内部 tile 进度映射到 30%~90%
+                        def tile_progress_callback(tile_idx: int, total_tiles: int):
+                            if not progress_callback:
+                                return
+                            try:
+                                # 30% ~ 90% 区间用于 tile 进度
+                                base = 30.0
+                                span = 60.0
+                                ratio = max(0.0, min(1.0, float(tile_idx) / float(total_tiles)))
+                                prog = int(base + span * ratio)
+                                # 使用 asyncio.create_task 调用异步 progress_callback，不阻塞推理
+                                asyncio.create_task(progress_callback(prog, f"Tile {tile_idx}/{total_tiles}"))
+                            except Exception:
+                                # 进度回调失败不影响主流程
+                                pass
+
+                        output, _ = upsampler.enhance(
+                            img,
+                            outscale=params.outscale,
+                            tile_progress_callback=tile_progress_callback,
+                        )
 
                     # 处理成功，跳出循环
                     break
@@ -569,12 +590,16 @@ async def enhance_image(
     face_enhance: bool = False,
     fp32: bool = False,
     outscale: Optional[float] = None,
-    processing_mode: str = "local"
+    processing_mode: str = "local",
+    experiment: Optional[str] = None,
 ):
     """图像增强接口（同步）"""
     # 验证文件类型
     if not file.content_type or not file.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="文件必须是图像格式")
+
+    # 后端接收到请求的时间
+    t_server_recv = time.time()
 
     # 读取文件
     image_data = await file.read()
@@ -592,22 +617,129 @@ async def enhance_image(
         processing_mode=processing_mode
     )
 
+    # 记录输入大小（用于网络流量分析）
+    input_size_bytes = len(image_data) if image_data is not None else 0
+
     # 处理图像
-    start_time = time.time()
+    t_infer_start = time.time()
     if processing_mode == "local":
         result_data, img_mode = await processing_service.enhance_image_local(image_data, params)
     else:
         result_data, img_mode = await processing_service.enhance_image_cloud(image_data, params)
 
-    processing_time = time.time() - start_time
+    t_infer_end = time.time()
 
-    # 返回结果
+    # 编码结果
     result_base64 = base64.b64encode(result_data).decode('utf-8')
+    output_size_bytes = len(result_data) if result_data is not None else 0
+
+    # 服务器侧处理总耗时（从收到请求到开始发送响应）
+    processing_time = t_server_send - t_server_recv
+
+    # 时间拆分指标（便于分析）：
+    # 前处理/排队时间（近似）：从收到请求到开始推理
+    pre_infer_time = t_infer_start - t_server_recv
+    # 纯推理时间
+    infer_time = t_infer_end - t_infer_start
+    # 推理后到开始发送响应的时间
+    post_infer_time = t_server_send - t_infer_end
+
+    # 解析实验配置（可选，用于日志标记，不影响处理逻辑）
+    experiment_info = None
+    if experiment:
+        try:
+            experiment_info = json.loads(experiment)
+        except json.JSONDecodeError:
+            experiment_info = {"raw": experiment}
+
+    # 根据实验配置中的 networkProfile 模拟网络延迟（low/medium/high）
+    network_profile = None
+    simulated_network_delay = 0.0
+    if isinstance(experiment_info, dict):
+        network_profile = experiment_info.get("networkProfile") or experiment_info.get("network_profile")
+        if network_profile == "low":
+            simulated_network_delay = 0.05
+        elif network_profile == "medium":
+            simulated_network_delay = 0.2
+        elif network_profile == "high":
+            simulated_network_delay = 0.6
+
+    if simulated_network_delay > 0:
+        try:
+            time.sleep(simulated_network_delay)
+        except Exception:
+            pass
+
+    # 服务器开始发送响应的时间
+    t_server_send = time.time()
+
+    # 资源占用采样（粗粒度）：CPU、进程内存、GPU 显存
+    try:
+        process = psutil.Process(os.getpid())
+        cpu_percent = psutil.cpu_percent(interval=0.0)
+        process_mem_mb = process.memory_info().rss / 1024**2
+    except Exception:
+        cpu_percent = None
+        process_mem_mb = None
+
+    if torch.cuda.is_available():
+        try:
+            gpu_mem_allocated_mb = torch.cuda.memory_allocated(0) / 1024**2
+            gpu_mem_reserved_mb = torch.cuda.memory_reserved(0) / 1024**2
+        except Exception:
+            gpu_mem_allocated_mb = None
+            gpu_mem_reserved_mb = None
+    else:
+        gpu_mem_allocated_mb = None
+        gpu_mem_reserved_mb = None
+
+    # 简单日志输出，便于后续分析
+    try:
+        log_entry = {
+            "type": "enhance_request",
+            "request_id": str(uuid.uuid4()),
+            "experiment": experiment_info,
+            "input_size_bytes": input_size_bytes,
+            "output_size_bytes": output_size_bytes,
+            "t_server_recv": t_server_recv,
+            "t_infer_start": t_infer_start,
+            "t_infer_end": t_infer_end,
+            "t_server_send": t_server_send,
+            "processing_time": processing_time,
+            "pre_infer_time": pre_infer_time,
+            "infer_time": infer_time,
+            "post_infer_time": post_infer_time,
+            "network_profile": network_profile,
+            "simulated_network_delay": simulated_network_delay,
+            "cpu_percent": cpu_percent,
+            "process_mem_mb": process_mem_mb,
+            "gpu_mem_allocated_mb": gpu_mem_allocated_mb,
+            "gpu_mem_reserved_mb": gpu_mem_reserved_mb,
+            "processing_mode": processing_mode,
+            "model_name": model_name,
+        }
+        print(json.dumps(log_entry, ensure_ascii=False))
+    except Exception:
+        # 日志失败不影响正常流程
+        pass
 
     return {
         "status": "success",
         "result_image": f"data:image/{'png' if img_mode == 'RGBA' else 'jpeg'};base64,{result_base64}",
-        "processing_time": round(processing_time, 2),
+        # 总处理时间（后端视角：收到请求 → 开始发送响应）
+        "processing_time": round(processing_time, 4),
+        # 时间拆分（秒）
+        "pre_infer_time": round(pre_infer_time, 4),
+        "infer_time": round(infer_time, 4),
+        "post_infer_time": round(post_infer_time, 4),
+        # 数据大小（字节）
+        "input_size_bytes": input_size_bytes,
+        "output_size_bytes": output_size_bytes,
+        # 资源占用（可能为 None，表示不可用）
+        "cpu_percent": cpu_percent,
+        "process_mem_mb": round(process_mem_mb, 2) if process_mem_mb is not None else None,
+        "gpu_mem_allocated_mb": round(gpu_mem_allocated_mb, 2) if gpu_mem_allocated_mb is not None else None,
+        "gpu_mem_reserved_mb": round(gpu_mem_reserved_mb, 2) if gpu_mem_reserved_mb is not None else None,
         "image_mode": img_mode or "RGB"
     }
 
@@ -738,14 +870,52 @@ async def enhance_image_stream(websocket: WebSocket):
 
             processing_time = time.time() - start_time
 
+            # 计算网络与资源指标（与 HTTP 接口字段保持一致）
+            input_size_bytes = len(image_data) if image_data is not None else 0
+            output_size_bytes = len(result_data) if result_data is not None else 0
+
+            # 时间拆分（WebSocket 下没有精确的 server_recv/send 概念，这里仅返回总处理时间）
+            pre_infer_time = None
+            infer_time = None
+            post_infer_time = None
+
+            # 资源占用（粗粒度）
+            try:
+                process = psutil.Process(os.getpid())
+                cpu_percent = psutil.cpu_percent(interval=0.0)
+                process_mem_mb = process.memory_info().rss / 1024**2
+            except Exception:
+                cpu_percent = None
+                process_mem_mb = None
+
+            if torch.cuda.is_available():
+                try:
+                    gpu_mem_allocated_mb = torch.cuda.memory_allocated(0) / 1024**2
+                    gpu_mem_reserved_mb = torch.cuda.memory_reserved(0) / 1024**2
+                except Exception:
+                    gpu_mem_allocated_mb = None
+                    gpu_mem_reserved_mb = None
+            else:
+                gpu_mem_allocated_mb = None
+                gpu_mem_reserved_mb = None
+
             # 编码结果
             result_base64 = base64.b64encode(result_data).decode('utf-8')
 
-            # 发送结果
+            # 发送结果（包含性能指标）
             await websocket.send_json({
                 "type": "result",
                 "result_image": f"data:image/{'png' if img_mode == 'RGBA' else 'jpeg'};base64,{result_base64}",
-                "processing_time": round(processing_time, 2),
+                "processing_time": round(processing_time, 4),
+                "pre_infer_time": pre_infer_time,
+                "infer_time": infer_time,
+                "post_infer_time": post_infer_time,
+                "input_size_bytes": input_size_bytes,
+                "output_size_bytes": output_size_bytes,
+                "cpu_percent": cpu_percent,
+                "process_mem_mb": round(process_mem_mb, 2) if process_mem_mb is not None else None,
+                "gpu_mem_allocated_mb": round(gpu_mem_allocated_mb, 2) if gpu_mem_allocated_mb is not None else None,
+                "gpu_mem_reserved_mb": round(gpu_mem_reserved_mb, 2) if gpu_mem_reserved_mb is not None else None,
                 "image_mode": img_mode or "RGB"
             })
 

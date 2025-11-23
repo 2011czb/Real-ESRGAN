@@ -142,3 +142,6 @@ dmypy.json
 # Node / frontend dependencies
 node_modules/
 frontend/node_modules/
+
+analysis.md
+gfpgan/

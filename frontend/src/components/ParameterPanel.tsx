@@ -3,7 +3,20 @@ import { Card, Form, Select, InputNumber, Switch, Space, Divider } from 'antd'
 import { useAppStore } from '../store'
 
 const ParameterPanel: React.FC = () => {
-  const { params, updateParams } = useAppStore()
+  const {
+    params,
+    updateParams,
+    nrQualityEnabled,
+    setNrQualityEnabled,
+    compressionEnabled,
+    compressionType,
+    compressionQuality,
+    updateCompression,
+    networkProfile,
+    setNetworkProfile,
+    transportProtocol,
+    setTransportProtocol,
+  } = useAppStore()
 
   return (
     <Card title="处理参数" bordered={false}>
@@ -92,6 +105,87 @@ const ParameterPanel: React.FC = () => {
               <div style={{ fontSize: 12, color: '#999' }}>
                 FP16 更快，FP32 更精确
               </div>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>在线无参考质量评估</span>
+              <Switch
+                checked={nrQualityEnabled}
+                onChange={(checked) => setNrQualityEnabled(checked)}
+              />
+              <div style={{ fontSize: 12, color: '#999', marginLeft: 8 }}>
+                开启后会在前端对结果图做简单质量评分，可能略微增加处理时间
+              </div>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>启用前端压缩</span>
+              <Switch
+                checked={compressionEnabled}
+                onChange={(checked) => updateCompression({ compressionEnabled: checked })}
+              />
+            </div>
+            {compressionEnabled && (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span>压缩类型</span>
+                  <Select
+                    style={{ width: 160 }}
+                    value={compressionType}
+                    onChange={(value) => updateCompression({ compressionType: value })}
+                    options={[
+                      { label: '有损压缩（JPEG/WebP）', value: 'lossy' },
+                      { label: '无损压缩（PNG）', value: 'lossless' },
+                    ]}
+                  />
+                </div>
+                {compressionType === 'lossy' && (
+                  <div style={{ marginTop: 8 }}>
+                    <Form.Item label="有损压缩质量 (0.1 - 1.0)">
+                      <InputNumber
+                        min={0.1}
+                        max={1.0}
+                        step={0.05}
+                        style={{ width: '100%' }}
+                        value={compressionQuality}
+                        onChange={(value) =>
+                          updateCompression({ compressionQuality: (value || 0.8) as number })
+                        }
+                      />
+                    </Form.Item>
+                  </div>
+                )}
+              </>
+            )}
+
+            <Divider style={{ margin: '12px 0' }} />
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>网络条件（用于延迟模拟，仅同步接口）</span>
+              <Select
+                style={{ width: 180 }}
+                value={networkProfile}
+                onChange={(value) => setNetworkProfile(value)}
+                options={[
+                  { label: '无（不模拟额外延迟）', value: 'none' },
+                  { label: '低延迟', value: 'low' },
+                  { label: '中等延迟', value: 'medium' },
+                  { label: '高延迟', value: 'high' },
+                ]}
+              />
+            </div>
+
+            <Divider style={{ margin: '12px 0' }} />
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>传输协议</span>
+              <Select
+                style={{ width: 220 }}
+                value={transportProtocol}
+                onChange={(value) => setTransportProtocol(value)}
+                options={[
+                  { label: '协议 A：WebSocket（JSON + Base64，带进度）', value: 'ws' },
+                  { label: '协议 B：HTTP（multipart 表单 + JSON 结果）', value: 'http' },
+                ]}
+              />
             </div>
           </Space>
         </Form.Item>
