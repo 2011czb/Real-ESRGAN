@@ -1,7 +1,8 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react'
 import { Upload, Button, Card, Progress, message, Space } from 'antd'
-import { InboxOutlined, PlayCircleOutlined, StopOutlined } from '@ant-design/icons'
+import { InboxOutlined, PlayCircleOutlined, StopOutlined, DownloadOutlined } from '@ant-design/icons'
 import type { UploadFile } from 'antd'
+import imageCompression from 'browser-image-compression'
 import ProcessingService, { EnhanceParams } from '../services/ProcessingService'
 import { useAppStore } from '../store'
 
@@ -13,6 +14,21 @@ interface ImageUploaderProps {
 
 const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
   const [fileList, setFileList] = useState<UploadFile[]>([])
+  const [resultList, setResultList] = useState<
+    {
+      name: string
+      url: string
+      processingTime?: number | null
+      endToEndTime?: number | null
+      inputSizeBytes?: number | null
+      outputSizeBytes?: number | null
+      cpuPercent?: number | null
+      processMemMb?: number | null
+      gpuMemAllocatedMb?: number | null
+      gpuMemReservedMb?: number | null
+      nrQualityScore?: number | null
+    }[]
+  >([])
   const [uploading, setUploading] = useState(false)
   const [progress, setProgress] = useState(0)
   const [progressMessage, setProgressMessage] = useState('')
@@ -41,6 +57,15 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
     networkProfile,
     transportProtocol,
   } = useAppStore()
+
+  const handleDownload = useCallback((imageUrl: string, filename: string) => {
+    const link = document.createElement('a')
+    link.href = imageUrl
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+  }, [])
 
   // 简单的无参考质量评估：基于结果图的清晰度/对比度给出 0-100 评分
   const computeNoRefQuality = useCallback((dataUrl: string): Promise<number> => {
@@ -118,9 +143,6 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
   const handleFileChange = useCallback((info: any) => {
     let newFileList = [...info.fileList]
 
-    // 限制只能上传一张图片
-    newFileList = newFileList.slice(-1)
-
     // 验证文件类型
     newFileList = newFileList.filter((file) => {
       if (file.type && !file.type.startsWith('image/')) {
@@ -141,7 +163,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
 
     setFileList(newFileList)
 
-    // 预览原图
+    // 预览原图：默认展示第一张选中的图片
     if (newFileList.length > 0 && newFileList[0].originFileObj) {
       const reader = new FileReader()
       reader.onload = (e) => {
@@ -152,7 +174,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
   }, [setOriginalImage])
 
   const handleProcess = useCallback(async () => {
-    if (fileList.length === 0 || !fileList[0].originFileObj) {
+    if (fileList.length === 0) {
       message.warning('请先选择要处理的图像')
       return
     }
@@ -168,76 +190,6 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
     setResultImage(null)
 
     try {
-      let file = fileList[0].originFileObj as File
-      const originalSize = file.size
-
-      // 如果启用前端压缩，先通过 Canvas 进行压缩
-      if (compressionEnabled && file) {
-        const compressedFile = await new Promise<File | null>((resolve) => {
-          const reader = new FileReader()
-          reader.onload = () => {
-            const img = new Image()
-            img.onload = () => {
-              try {
-                const canvas = document.createElement('canvas')
-                const ctx = canvas.getContext('2d')
-                if (!ctx) {
-                  resolve(null)
-                  return
-                }
-
-                // 为避免大图导致前端内存/性能问题，限制最大边长
-                const maxDim = 2048
-                const scale = Math.min(1, maxDim / Math.max(img.width, img.height))
-                const targetWidth = Math.max(1, Math.round(img.width * scale))
-                const targetHeight = Math.max(1, Math.round(img.height * scale))
-
-                canvas.width = targetWidth
-                canvas.height = targetHeight
-                ctx.drawImage(img, 0, 0, targetWidth, targetHeight)
-
-                const mimeType =
-                  compressionType === 'lossy' ? 'image/jpeg' : 'image/png'
-
-                const quality = compressionType === 'lossy' ? compressionQuality : 1.0
-
-                canvas.toBlob(
-                  (blob) => {
-                    if (!blob) {
-                      resolve(null)
-                      return
-                    }
-                    const newFile = new File([blob], file.name, {
-                      type: mimeType,
-                      lastModified: Date.now(),
-                    })
-                    resolve(newFile)
-                  },
-                  mimeType,
-                  quality
-                )
-              } catch {
-                resolve(null)
-              }
-            }
-            img.onerror = () => resolve(null)
-            img.src = reader.result as string
-          }
-          reader.onerror = () => resolve(null)
-          reader.readAsDataURL(file)
-        })
-
-        if (compressedFile) {
-          file = compressedFile
-        }
-
-        // 更新上传大小指标：使用压缩后的文件大小
-        setInputSizeBytes(file.size)
-      } else {
-        // 未启用压缩时，使用原始文件大小且不做任何前端重编码
-        setInputSizeBytes(originalSize)
-      }
-
       const enhanceParams: EnhanceParams = {
         model_name: params.modelName,
         scale: params.scale,
@@ -249,83 +201,157 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
         outscale: params.outscale || undefined,
       }
 
-      let result: any
+      // 抽取单张图片的处理逻辑，便于在云端模式下并行处理
+      const processSingleFile = async (uploadFile: UploadFile) => {
+        if (!uploadFile.originFileObj) return
 
-      if (transportProtocol === 'ws') {
-        // 协议 A：WebSocket，带进度推送（记录流式进度日志）
-        result = await processingService.enhanceImageWithProgress(
-          file,
-          enhanceParams,
-          (progressValue, message) => {
-            setProgress(progressValue)
-            setProgressMessage(message)
-            setProgressLogs((logs) => [
-              ...logs,
-              `[进度] ${new Date().toLocaleTimeString()} - ${message}（${progressValue.toFixed(0)}%）`,
-            ])
+        let file = uploadFile.originFileObj as File
+        const originalSize = file.size
+
+        // 如果启用前端压缩，使用 browser-image-compression 进行压缩
+        if (compressionEnabled && file) {
+          try {
+            const options = {
+              // 为避免大图导致前端内存/性能问题，限制最大边长
+              maxWidthOrHeight: 2048,
+              // 有损压缩时使用传入的压缩质量；无损时保持质量为 1
+              initialQuality: compressionType === 'lossy' ? compressionQuality : 1.0,
+              useWebWorker: true,
+              fileType: compressionType === 'lossy' ? 'image/jpeg' : 'image/png',
+            } as const
+
+            const compressedFile = await imageCompression(file, options)
+            if (compressedFile && compressedFile.size > 0) {
+              file = compressedFile as File
+            }
+          } catch {
+            // 压缩失败时退回到原始文件，避免阻塞整体流程
+            file = file
           }
-        )
-      } else {
-        // 协议 B：HTTP 同步接口，使用 networkProfile 进行网络延迟模拟
-        setProgress(10)
-        setProgressMessage('上传中...')
 
-        result = await processingService.enhanceImage(file, enhanceParams, {
-          networkProfile,
-        })
-
-        setProgress(90)
-        setProgressMessage('服务器处理中...')
-      }
-
-      // 检查是否被取消
-      if (result.status === 'cancelled') {
-        message.info('处理已取消')
-        setProgress(0)
-        setProgressMessage('已取消')
-        return
-      }
-
-      if (result.status === 'success' && result.result_image) {
-        setResultImage(result.result_image)
-        // 后端处理耗时（来自后端返回的 processing_time）
-        if (result.processing_time) {
-          setProcessingTime(result.processing_time)
-          setBackendProcessingTime(result.processing_time)
+          // 更新上传大小指标：使用压缩后的文件大小
+          setInputSizeBytes(file.size)
         } else {
-          setBackendProcessingTime(null)
+          // 未启用压缩时，使用原始文件大小且不做任何前端重编码
+          setInputSizeBytes(originalSize)
         }
 
-        // 端到端耗时（从点击到结果处理完成）
-        const tDisplay = performance.now()
-        const endToEndSeconds = (tDisplay - tClick) / 1000
-        setEndToEndTime(endToEndSeconds)
+        let result: any
 
-        // 网络流量与资源占用（如果后端返回了）
-        setInputSizeBytes(result.input_size_bytes ?? null)
-        setOutputSizeBytes(result.output_size_bytes ?? null)
-        setCpuPercent(result.cpu_percent ?? null)
-        setProcessMemMb(result.process_mem_mb ?? null)
-        setGpuMemAllocatedMb(result.gpu_mem_allocated_mb ?? null)
-        setGpuMemReservedMb(result.gpu_mem_reserved_mb ?? null)
+        if (transportProtocol === 'ws') {
+          // 协议 A：WebSocket，带进度推送（记录流式进度日志）
+          result = await processingService.enhanceImageWithProgress(
+            file,
+            enhanceParams,
+            (progressValue, message) => {
+              setProgress(progressValue)
+              setProgressMessage(message)
+              setProgressLogs((logs) => [
+                ...logs,
+                `[进度] ${new Date().toLocaleTimeString()} - ${message}（${progressValue.toFixed(0)}%）`,
+              ])
+            }
+          )
+        } else {
+          // 协议 B：HTTP 同步接口，使用 networkProfile 进行网络延迟模拟
+          setProgress(10)
+          setProgressMessage('上传中...')
 
-        // 在线无参考质量评估（可选）
-        if (nrQualityEnabled) {
-          try {
-            const score = await computeNoRefQuality(result.result_image)
-            setNrQualityScore(score)
-          } catch {
+          result = await processingService.enhanceImage(file, enhanceParams, {
+            networkProfile,
+          })
+
+          setProgress(90)
+          setProgressMessage('服务器处理中...')
+        }
+
+        // 检查是否被取消
+        if (result.status === 'cancelled') {
+          message.info('处理已取消')
+          setProgress(0)
+          setProgressMessage('已取消')
+          return
+        }
+
+        if (result.status === 'success' && result.result_image) {
+          setResultImage(result.result_image)
+
+          // 端到端耗时（从点击到结果处理完成）
+          const tDisplay = performance.now()
+          const endToEndSeconds = (tDisplay - tClick) / 1000
+          setEndToEndTime(endToEndSeconds)
+
+          // 网络流量与资源占用（如果后端返回了）
+          setInputSizeBytes(result.input_size_bytes ?? null)
+          setOutputSizeBytes(result.output_size_bytes ?? null)
+          setCpuPercent(result.cpu_percent ?? null)
+          setProcessMemMb(result.process_mem_mb ?? null)
+          setGpuMemAllocatedMb(result.gpu_mem_allocated_mb ?? null)
+          setGpuMemReservedMb(result.gpu_mem_reserved_mb ?? null)
+
+          // 在线无参考质量评估（可选）
+          let qualityScore: number | null = null
+          if (nrQualityEnabled) {
+            try {
+              const score = await computeNoRefQuality(result.result_image)
+              qualityScore = score
+              setNrQualityScore(score)
+            } catch {
+              qualityScore = null
+              setNrQualityScore(null)
+            }
+          } else {
             setNrQualityScore(null)
           }
-        } else {
-          setNrQualityScore(null)
-        }
 
-        message.success(
-          `处理完成！后端耗时 ${result.processing_time?.toFixed(2)} 秒，端到端耗时 ${endToEndSeconds.toFixed(2)} 秒`
-        )
+          // 后端处理耗时（来自后端返回的 processing_time）
+          if (result.processing_time) {
+            setProcessingTime(result.processing_time)
+            setBackendProcessingTime(result.processing_time)
+          } else {
+            setBackendProcessingTime(null)
+          }
+
+          // 将本次结果及其指标追加到结果列表中，避免被后续图片覆盖
+          setResultList((list) => [
+            ...list,
+            {
+              name: uploadFile.name,
+              url: result.result_image,
+              processingTime: result.processing_time ?? null,
+              endToEndTime: endToEndSeconds,
+              inputSizeBytes: result.input_size_bytes ?? null,
+              outputSizeBytes: result.output_size_bytes ?? null,
+              cpuPercent: result.cpu_percent ?? null,
+              processMemMb: result.process_mem_mb ?? null,
+              gpuMemAllocatedMb: result.gpu_mem_allocated_mb ?? null,
+              gpuMemReservedMb: result.gpu_mem_reserved_mb ?? null,
+              nrQualityScore: qualityScore,
+            },
+          ])
+
+          message.success(
+            `处理完成！后端耗时 ${result.processing_time?.toFixed(2)} 秒，端到端耗时 ${endToEndSeconds.toFixed(2)} 秒`
+          )
+        } else {
+          message.error(result.error || '处理失败')
+        }
+      }
+
+      const isCloudMode =
+        typeof (processingService as any).getMode === 'function' &&
+        (processingService as any).getMode() === 'cloud'
+
+      // WebSocket 或本地模式：保持顺序处理，保证进度条体验
+      if (transportProtocol === 'ws' || !isCloudMode) {
+        for (const uploadFile of fileList) {
+          // 依次处理选中的每一张图片
+          // eslint-disable-next-line no-await-in-loop
+          await processSingleFile(uploadFile)
+        }
       } else {
-        message.error(result.error || '处理失败')
+        // 云端 + HTTP 模式：对多张图片并行发起请求，让后端和云端并行处理
+        await Promise.all(fileList.map((uploadFile) => processSingleFile(uploadFile)))
       }
     } catch (error: any) {
       // 如果是取消操作，不显示错误
@@ -365,13 +391,13 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
     }
 
     const interval = window.setInterval(() => {
-      // 假进度：在 30%-90% 区间内缓慢推进，等待服务器真实结果
+      // 在 30%-90% 区间内缓慢推进，等待服务器真实结果
       setProgress((prev) => {
         const next = prev >= 90 ? prev : Math.min(90, prev + 5)
         if (next !== prev) {
           setProgressLogs((logs) => [
             ...logs,
-            `[假进度] ${new Date().toLocaleTimeString()} - 估算进度约 ${next.toFixed(
+            ` ${new Date().toLocaleTimeString()} - 处理进度 ${next.toFixed(
               0
             )}%（等待服务器结果）`,
           ])
@@ -406,6 +432,7 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
     setFileList([])
     setOriginalImage(null)
     setResultImage(null)
+    setResultList([])
   }, [setOriginalImage, setResultImage])
 
   return (
@@ -417,7 +444,6 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
           onRemove={handleRemove}
           beforeUpload={() => false} // 阻止自动上传
           accept="image/*"
-          maxCount={1}
           disabled={uploading}
         >
           <p className="ant-upload-drag-icon">
@@ -459,6 +485,104 @@ const ImageUploader: React.FC<ImageUploaderProps> = ({ processingService }) => {
                 ))}
               </div>
             )}
+
+          </div>
+        )}
+
+        {resultList.length > 0 && (
+          <div style={{ width: '100%' }}>
+            <div style={{ marginBottom: 8 }}>结果图预览：</div>
+            <div
+              style={{
+                display: 'flex',
+                flexWrap: 'wrap',
+                gap: 12,
+              }}
+            >
+              {resultList.map((item, index) => (
+                <div key={`${item.name}-${index}`} style={{ width: 120, textAlign: 'center' }}>
+                  <img
+                    src={item.url}
+                    alt={item.name}
+                    style={{ width: '100%', height: 'auto', borderRadius: 4 }}
+                  />
+                  <div style={{ marginTop: 4, fontSize: 12, color: '#666' }}>{item.name}</div>
+                  <div style={{ marginTop: 4 }}>
+                    <Button
+                      size="small"
+                      icon={<DownloadOutlined />}
+                      onClick={() => handleDownload(item.url, item.name || `result-${index + 1}.png`)}
+                    >
+                      下载
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ marginTop: 16 }}>
+              <div style={{ marginBottom: 8 }}>图片指标参数：</div>
+              <div
+                style={{
+                  maxHeight: 240,
+                  overflowY: 'auto',
+                  border: '1px solid #f0f0f0',
+                  borderRadius: 4,
+                  padding: '8px 12px',
+                  fontSize: 12,
+                  color: '#555',
+                }}
+              >
+                {resultList.map((item, index) => (
+                  <div
+                    key={`metrics-${item.name}-${index}`}
+                    style={{
+                      padding: '6px 0',
+                      borderBottom: index === resultList.length - 1 ? 'none' : '1px solid #f5f5f5',
+                    }}
+                  >
+                    <div style={{ fontWeight: 500 }}>{item.name}</div>
+                    <div>后端耗时：{item.processingTime != null ? `${item.processingTime.toFixed(2)} s` : '—'}</div>
+                    <div>端到端耗时：{item.endToEndTime != null ? `${item.endToEndTime.toFixed(2)} s` : '—'}</div>
+                    <div>
+                      输入大小：
+                      {item.inputSizeBytes != null
+                        ? `${(item.inputSizeBytes / 1024 / 1024).toFixed(2)} MB`
+                        : '—'}
+                    </div>
+                    <div>
+                      输出大小：
+                      {item.outputSizeBytes != null
+                        ? `${(item.outputSizeBytes / 1024 / 1024).toFixed(2)} MB`
+                        : '—'}
+                    </div>
+                    <div>
+                      CPU 使用率：{item.cpuPercent != null ? `${item.cpuPercent.toFixed(1)} %` : '—'}
+                    </div>
+                    <div>
+                      进程内存：
+                      {item.processMemMb != null ? `${item.processMemMb.toFixed(1)} MB` : '—'}
+                    </div>
+                    <div>
+                      GPU 显存占用：
+                      {item.gpuMemAllocatedMb != null
+                        ? `${item.gpuMemAllocatedMb.toFixed(1)} MB`
+                        : '—'}
+                    </div>
+                    <div>
+                      GPU 预留显存：
+                      {item.gpuMemReservedMb != null
+                        ? `${item.gpuMemReservedMb.toFixed(1)} MB`
+                        : '—'}
+                    </div>
+                    <div>
+                      无参考质量评分：
+                      {item.nrQualityScore != null ? item.nrQualityScore.toFixed(1) : '—'}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         )}
 

@@ -17,6 +17,7 @@ import cv2
 import numpy as np
 import psutil
 import torch
+import httpx
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -394,16 +395,66 @@ class ProcessingService:
         params: EnhanceRequest,
         progress_callback=None
     ):
-        """云端处理图像（当前复用本地处理逻辑）"""
-        # 当前部署场景下，"云端" 模式表示：前端通过公网IP访问本服务，
-        # 实际推理仍由本机执行，因此这里直接调用本地处理实现。
-        result_data, img_mode = await self.enhance_image_local(
-            image_data,
-            params,
-            progress_callback,
-            task_id=None,
-            check_cancelled=None,
-        )
+        """云端处理图像：将请求转发到外部云端推理服务。
+
+        说明：
+        - 前端通过 /api/v1/config/cloud-endpoints 配置 cloud_endpoints["inference" ]
+        - 本服务在 cloud 模式下只做转发与结果解码，具体并行扩展由云端推理服务负责
+        - 由于本函数是 async 的，FastAPI 可以在 cloud 模式下同时处理多张图片的请求
+        """
+
+        if not self.cloud_endpoints.get("inference"):
+            raise HTTPException(status_code=500, detail="云端接口未配置")
+
+        inference_url = self.cloud_endpoints["inference"]
+
+        # 准备上传的数据（单张图片），并保留与本地模式一致的参数字段
+        files = {"file": ("image.png", image_data, "image/png")}
+        data = {
+            "model_name": params.model_name,
+            "scale": params.scale,
+            "tile": params.tile,
+            "tile_pad": params.tile_pad,
+            "pre_pad": params.pre_pad,
+            "face_enhance": params.face_enhance,
+            "fp32": params.fp32,
+            "outscale": params.outscale,
+            "processing_mode": "cloud",
+        }
+
+        # 调用云端推理 API
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            if progress_callback:
+                try:
+                    await progress_callback(10, "正在上传图像到云端...")
+                except Exception:
+                    pass
+
+            resp = await client.post(f"{inference_url}/api/v1/enhance", files=files, data=data)
+
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+            result = resp.json()
+
+        # 可选进度回调：云端处理完成
+        if progress_callback:
+            try:
+                await progress_callback(100, "云端处理完成")
+            except Exception:
+                pass
+
+        # 解码云端返回的 base64 图像
+        result_image_base64 = (result.get("result_image") or "").split(",")[-1]
+        if not result_image_base64:
+            raise HTTPException(status_code=500, detail="云端返回结果中缺少图像数据")
+
+        try:
+            result_data = base64.b64decode(result_image_base64)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"解码云端结果失败: {e}")
+
+        img_mode = result.get("image_mode", "RGB")
         return result_data, img_mode
 
     def _create_upsampler(self, params: EnhanceRequest):
