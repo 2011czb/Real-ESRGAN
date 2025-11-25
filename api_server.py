@@ -4,13 +4,17 @@ Real-ESRGAN API Server
 """
 import asyncio
 import base64
+import csv
 import io
 import json
+import math
 import os
 import signal
 import sys
+import threading
 import time
 import uuid
+from datetime import datetime
 from typing import Optional
 
 import cv2
@@ -27,6 +31,8 @@ from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
 from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 app = FastAPI(title="Real-ESRGAN API Server", version="1.0.0")
 
@@ -48,6 +54,150 @@ task_cancelled = {}
 server_shutting_down = False
 # 活跃的WebSocket连接
 active_websockets = set()
+
+
+class MetricsRecorder:
+    """轻量级指标记录器，在关闭前落盘，降低运行时开销"""
+
+    def __init__(self, output_dir: str):
+        self._lock = threading.Lock()
+        self._records = []
+        self._output_dir = output_dir
+        self._start_time = time.time()
+
+    def add_record(self, record: dict):
+        """记录一次请求指标，避免在主流程做额外计算"""
+        lightweight_record = record.copy()
+        with self._lock:
+            self._records.append(lightweight_record)
+
+    def _summarize(self, records: list):
+        total = len(records)
+        if total == 0:
+            return {}
+
+        counts = {"success": 0, "error": 0, "timeout": 0, "cancelled": 0}
+        processing_times = []
+        recovery_times = []
+        last_failure_end = None
+
+        ordered = sorted(records, key=lambda x: x.get("end_ts") or x.get("start_ts") or 0)
+        for rec in ordered:
+            status = rec.get("status") or "unknown"
+            if status in counts:
+                counts[status] += 1
+
+            if rec.get("processing_time") is not None:
+                processing_times.append(rec["processing_time"])
+
+            if status in ("error", "timeout"):
+                last_failure_end = rec.get("end_ts") or rec.get("start_ts")
+            elif status == "success" and last_failure_end is not None:
+                success_start = rec.get("start_ts") or rec.get("end_ts")
+                if success_start is not None:
+                    recovery_times.append(max(0.0, success_start - last_failure_end))
+                last_failure_end = None
+
+        def ratio(count):
+            return round(count / total, 4) if total else 0.0
+
+        p95_time = None
+        if processing_times:
+            sorted_times = sorted(processing_times)
+            idx = max(0, min(len(sorted_times) - 1, math.ceil(len(sorted_times) * 0.95) - 1))
+            p95_time = round(sorted_times[idx], 4)
+
+        summary = {
+            "总请求数": total,
+            "成功率": ratio(counts["success"]),
+            "错误率": ratio(counts["error"]),
+            "超时率": ratio(counts["timeout"]),
+            "取消率": ratio(counts["cancelled"]),
+            "平均处理时间": round(sum(processing_times) / len(processing_times), 4)
+            if processing_times else None,
+            "P95处理时间": p95_time,
+            "平均恢复时间": round(sum(recovery_times) / len(recovery_times), 4)
+            if recovery_times else None,
+        }
+        return summary
+
+    def persist(self):
+        """在服务退出前写入表格文件"""
+        with self._lock:
+            records = list(self._records)
+
+        if not records:
+            print("无请求指标需要保存，跳过生成表格")
+            return
+
+        os.makedirs(self._output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(self._output_dir, f"server_metrics_{timestamp}.csv")
+
+        # 使用中文表头
+        headers = [
+            "请求ID",
+            "通道类型",
+            "状态",
+            "模型名称",
+            "处理模式",
+            "处理时间_秒",
+            "推理前时间_秒",
+            "推理时间_秒",
+            "推理后时间_秒",
+            "输入大小_字节",
+            "输出大小_字节",
+            "CPU使用率_百分比",
+            "进程内存_MB",
+            "GPU内存已分配_MB",
+            "GPU内存已预留_MB",
+            "开始时间戳",
+            "结束时间戳",
+            "错误信息",
+        ]
+
+        # 字段映射到英文键名
+        field_mapping = {
+            "请求ID": "request_id",
+            "通道类型": "channel",
+            "状态": "status",
+            "模型名称": "model_name",
+            "处理模式": "processing_mode",
+            "处理时间_秒": "processing_time",
+            "推理前时间_秒": "pre_infer_time",
+            "推理时间_秒": "infer_time",
+            "推理后时间_秒": "post_infer_time",
+            "输入大小_字节": "input_size_bytes",
+            "输出大小_字节": "output_size_bytes",
+            "CPU使用率_百分比": "cpu_percent",
+            "进程内存_MB": "process_mem_mb",
+            "GPU内存已分配_MB": "gpu_mem_allocated_mb",
+            "GPU内存已预留_MB": "gpu_mem_reserved_mb",
+            "开始时间戳": "start_ts",
+            "结束时间戳": "end_ts",
+            "错误信息": "error_message",
+        }
+
+        try:
+            with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(headers)
+                for rec in records:
+                    row = [rec.get(field_mapping[col]) for col in headers]
+                    writer.writerow(row)
+
+                writer.writerow([])
+                summary = self._summarize(records)
+                if summary:
+                    writer.writerow(["统计指标", "数值"])
+                    for key, value in summary.items():
+                        writer.writerow([key, value])
+            print(f"请求指标表格已生成：{output_path}")
+        except Exception as exc:
+            print(f"保存指标表格失败: {exc}")
+
+
+metrics_recorder = MetricsRecorder(output_dir=os.path.join(ROOT_DIR, "results"))
 
 
 class EnhanceRequest(BaseModel):
@@ -587,6 +737,12 @@ def cleanup_resources():
     task_cancelled.clear()
     active_websockets.clear()
 
+    # 6. 生成指标表格
+    try:
+        metrics_recorder.persist()
+    except Exception as exc:
+        print(f"生成指标表格失败: {exc}")
+
     print("资源清理完成")
 
 
@@ -645,12 +801,24 @@ async def enhance_image(
     experiment: Optional[str] = None,
 ):
     """图像增强接口（同步）"""
+    request_id = str(uuid.uuid4())
+    channel = "http"
+    status = "success"
+    error_message = None
+
     # 验证文件类型
     if not file.content_type or not file.content_type.startswith('image/'):
         raise HTTPException(status_code=400, detail="文件必须是图像格式")
 
     # 后端接收到请求的时间
     t_server_recv = time.time()
+    t_infer_start = None
+    t_infer_end = None
+    t_server_send = None
+    processing_time = None
+    pre_infer_time = None
+    infer_time = None
+    post_infer_time = None
 
     # 读取文件
     image_data = await file.read()
@@ -670,129 +838,168 @@ async def enhance_image(
 
     # 记录输入大小（用于网络流量分析）
     input_size_bytes = len(image_data) if image_data is not None else 0
+    output_size_bytes = None
+    cpu_percent = None
+    process_mem_mb = None
+    gpu_mem_allocated_mb = None
+    gpu_mem_reserved_mb = None
+    img_mode = None
+    result_data = None
 
-    # 处理图像
-    t_infer_start = time.time()
-    if processing_mode == "local":
-        result_data, img_mode = await processing_service.enhance_image_local(image_data, params)
-    else:
-        result_data, img_mode = await processing_service.enhance_image_cloud(image_data, params)
-
-    t_infer_end = time.time()
-
-    # 编码结果
-    result_base64 = base64.b64encode(result_data).decode('utf-8')
-    output_size_bytes = len(result_data) if result_data is not None else 0
-
-    # 服务器侧处理总耗时（从收到请求到开始发送响应）
-    processing_time = t_server_send - t_server_recv
-
-    # 时间拆分指标（便于分析）：
-    # 前处理/排队时间（近似）：从收到请求到开始推理
-    pre_infer_time = t_infer_start - t_server_recv
-    # 纯推理时间
-    infer_time = t_infer_end - t_infer_start
-    # 推理后到开始发送响应的时间
-    post_infer_time = t_server_send - t_infer_end
-
-    # 解析实验配置（可选，用于日志标记，不影响处理逻辑）
-    experiment_info = None
-    if experiment:
-        try:
-            experiment_info = json.loads(experiment)
-        except json.JSONDecodeError:
-            experiment_info = {"raw": experiment}
-
-    # 根据实验配置中的 networkProfile 模拟网络延迟（low/medium/high）
-    network_profile = None
-    simulated_network_delay = 0.0
-    if isinstance(experiment_info, dict):
-        network_profile = experiment_info.get("networkProfile") or experiment_info.get("network_profile")
-        if network_profile == "low":
-            simulated_network_delay = 0.05
-        elif network_profile == "medium":
-            simulated_network_delay = 0.2
-        elif network_profile == "high":
-            simulated_network_delay = 0.6
-
-    if simulated_network_delay > 0:
-        try:
-            time.sleep(simulated_network_delay)
-        except Exception:
-            pass
-
-    # 服务器开始发送响应的时间
-    t_server_send = time.time()
-
-    # 资源占用采样（粗粒度）：CPU、进程内存、GPU 显存
     try:
-        process = psutil.Process(os.getpid())
-        cpu_percent = psutil.cpu_percent(interval=0.0)
-        process_mem_mb = process.memory_info().rss / 1024**2
-    except Exception:
-        cpu_percent = None
-        process_mem_mb = None
+        # 处理图像
+        t_infer_start = time.time()
+        if processing_mode == "local":
+            result_data, img_mode = await processing_service.enhance_image_local(image_data, params)
+        else:
+            result_data, img_mode = await processing_service.enhance_image_cloud(image_data, params)
 
-    if torch.cuda.is_available():
+        t_infer_end = time.time()
+
+        # 编码结果
+        result_base64 = base64.b64encode(result_data).decode('utf-8')
+        output_size_bytes = len(result_data) if result_data is not None else 0
+
+        # 解析实验配置（可选，用于日志标记，不影响处理逻辑）
+        experiment_info = None
+        if experiment:
+            try:
+                experiment_info = json.loads(experiment)
+            except json.JSONDecodeError:
+                experiment_info = {"raw": experiment}
+
+        # 根据实验配置中的 networkProfile 模拟网络延迟（low/medium/high）
+        network_profile = None
+        simulated_network_delay = 0.0
+        if isinstance(experiment_info, dict):
+            network_profile = experiment_info.get("networkProfile") or experiment_info.get("network_profile")
+            if network_profile == "low":
+                simulated_network_delay = 0.05
+            elif network_profile == "medium":
+                simulated_network_delay = 0.2
+            elif network_profile == "high":
+                simulated_network_delay = 0.6
+
+        if simulated_network_delay > 0:
+            try:
+                time.sleep(simulated_network_delay)
+            except Exception:
+                pass
+
+        # 服务器开始发送响应的时间
+        t_server_send = time.time()
+
+        # 服务器侧处理总耗时（从收到请求到开始发送响应）
+        processing_time = t_server_send - t_server_recv
+
+        # 时间拆分指标（便于分析）：
+        pre_infer_time = (t_infer_start - t_server_recv) if t_infer_start else None
+        infer_time = (t_infer_end - t_infer_start) if (t_infer_start and t_infer_end) else None
+        post_infer_time = (t_server_send - t_infer_end) if (t_infer_end and t_server_send) else None
+
+        # 资源占用采样（粗粒度）：CPU、进程内存、GPU 显存
         try:
-            gpu_mem_allocated_mb = torch.cuda.memory_allocated(0) / 1024**2
-            gpu_mem_reserved_mb = torch.cuda.memory_reserved(0) / 1024**2
+            process = psutil.Process(os.getpid())
+            cpu_percent = psutil.cpu_percent(interval=0.0)
+            process_mem_mb = process.memory_info().rss / 1024**2
         except Exception:
+            cpu_percent = None
+            process_mem_mb = None
+
+        if torch.cuda.is_available():
+            try:
+                gpu_mem_allocated_mb = torch.cuda.memory_allocated(0) / 1024**2
+                gpu_mem_reserved_mb = torch.cuda.memory_reserved(0) / 1024**2
+            except Exception:
+                gpu_mem_allocated_mb = None
+                gpu_mem_reserved_mb = None
+        else:
             gpu_mem_allocated_mb = None
             gpu_mem_reserved_mb = None
-    else:
-        gpu_mem_allocated_mb = None
-        gpu_mem_reserved_mb = None
 
-    # 简单日志输出，便于后续分析
-    try:
-        log_entry = {
-            "type": "enhance_request",
-            "request_id": str(uuid.uuid4()),
-            "experiment": experiment_info,
+        # 简单日志输出，便于后续分析
+        try:
+            log_entry = {
+                "type": "enhance_request",
+                "request_id": request_id,
+                "experiment": experiment_info,
+                "input_size_bytes": input_size_bytes,
+                "output_size_bytes": output_size_bytes,
+                "t_server_recv": t_server_recv,
+                "t_infer_start": t_infer_start,
+                "t_infer_end": t_infer_end,
+                "t_server_send": t_server_send,
+                "processing_time": processing_time,
+                "pre_infer_time": pre_infer_time,
+                "infer_time": infer_time,
+                "post_infer_time": post_infer_time,
+                "network_profile": network_profile,
+                "simulated_network_delay": simulated_network_delay,
+                "cpu_percent": cpu_percent,
+                "process_mem_mb": process_mem_mb,
+                "gpu_mem_allocated_mb": gpu_mem_allocated_mb,
+                "gpu_mem_reserved_mb": gpu_mem_reserved_mb,
+                "processing_mode": processing_mode,
+                "model_name": model_name,
+            }
+            print(json.dumps(log_entry, ensure_ascii=False))
+        except Exception:
+            # 日志失败不影响正常流程
+            pass
+
+        return {
+            "status": "success",
+            "result_image": f"data:image/{'png' if img_mode == 'RGBA' else 'jpeg'};base64,{result_base64}",
+            # 总处理时间（后端视角：收到请求 → 开始发送响应）
+            "processing_time": round(processing_time, 4) if processing_time is not None else None,
+            # 时间拆分（秒）
+            "pre_infer_time": round(pre_infer_time, 4) if pre_infer_time is not None else None,
+            "infer_time": round(infer_time, 4) if infer_time is not None else None,
+            "post_infer_time": round(post_infer_time, 4) if post_infer_time is not None else None,
+            # 数据大小（字节）
             "input_size_bytes": input_size_bytes,
             "output_size_bytes": output_size_bytes,
-            "t_server_recv": t_server_recv,
-            "t_infer_start": t_infer_start,
-            "t_infer_end": t_infer_end,
-            "t_server_send": t_server_send,
+            # 资源占用（可能为 None，表示不可用）
+            "cpu_percent": cpu_percent,
+            "process_mem_mb": round(process_mem_mb, 2) if process_mem_mb is not None else None,
+            "gpu_mem_allocated_mb": round(gpu_mem_allocated_mb, 2) if gpu_mem_allocated_mb is not None else None,
+            "gpu_mem_reserved_mb": round(gpu_mem_reserved_mb, 2) if gpu_mem_reserved_mb is not None else None,
+            "image_mode": img_mode or "RGB"
+        }
+    except HTTPException as exc:
+        status = "timeout" if exc.status_code == 408 else "error"
+        detail = exc.detail
+        error_message = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)
+        raise
+    except asyncio.TimeoutError as exc:
+        status = "timeout"
+        error_message = str(exc)
+        raise HTTPException(status_code=408, detail="处理超时") from exc
+    except Exception as exc:
+        status = "error"
+        error_message = str(exc)
+        raise
+    finally:
+        metrics_recorder.add_record({
+            "request_id": request_id,
+            "channel": channel,
+            "status": status,
+            "model_name": model_name,
+            "processing_mode": processing_mode,
             "processing_time": processing_time,
             "pre_infer_time": pre_infer_time,
             "infer_time": infer_time,
             "post_infer_time": post_infer_time,
-            "network_profile": network_profile,
-            "simulated_network_delay": simulated_network_delay,
+            "input_size_bytes": input_size_bytes,
+            "output_size_bytes": output_size_bytes,
             "cpu_percent": cpu_percent,
             "process_mem_mb": process_mem_mb,
             "gpu_mem_allocated_mb": gpu_mem_allocated_mb,
             "gpu_mem_reserved_mb": gpu_mem_reserved_mb,
-            "processing_mode": processing_mode,
-            "model_name": model_name,
-        }
-        print(json.dumps(log_entry, ensure_ascii=False))
-    except Exception:
-        # 日志失败不影响正常流程
-        pass
-
-    return {
-        "status": "success",
-        "result_image": f"data:image/{'png' if img_mode == 'RGBA' else 'jpeg'};base64,{result_base64}",
-        # 总处理时间（后端视角：收到请求 → 开始发送响应）
-        "processing_time": round(processing_time, 4),
-        # 时间拆分（秒）
-        "pre_infer_time": round(pre_infer_time, 4),
-        "infer_time": round(infer_time, 4),
-        "post_infer_time": round(post_infer_time, 4),
-        # 数据大小（字节）
-        "input_size_bytes": input_size_bytes,
-        "output_size_bytes": output_size_bytes,
-        # 资源占用（可能为 None，表示不可用）
-        "cpu_percent": cpu_percent,
-        "process_mem_mb": round(process_mem_mb, 2) if process_mem_mb is not None else None,
-        "gpu_mem_allocated_mb": round(gpu_mem_allocated_mb, 2) if gpu_mem_allocated_mb is not None else None,
-        "gpu_mem_reserved_mb": round(gpu_mem_reserved_mb, 2) if gpu_mem_reserved_mb is not None else None,
-        "image_mode": img_mode or "RGB"
-    }
+            "start_ts": t_server_recv,
+            "end_ts": t_server_send or time.time(),
+            "error_message": error_message,
+        })
 
 
 @app.websocket("/api/v1/enhance/stream")
@@ -874,6 +1081,12 @@ async def enhance_image_stream(websocket: WebSocket):
 
         # 解码图像
         image_data = base64.b64decode(image_base64.split(',')[1] if ',' in image_base64 else image_base64)
+        input_size_bytes = len(image_data) if image_data is not None else 0
+        output_size_bytes = None
+        cpu_percent = None
+        process_mem_mb = None
+        gpu_mem_allocated_mb = None
+        gpu_mem_reserved_mb = None
 
         # 创建请求参数
         params = EnhanceRequest(
@@ -905,6 +1118,32 @@ async def enhance_image_stream(websocket: WebSocket):
 
         # 处理图像
         start_time = time.time()
+        processing_time = None
+        status = "success"
+        error_message = None
+
+        def record_metrics(status_label: str, err_msg: Optional[str] = None):
+            metrics_recorder.add_record({
+                "request_id": task_id,
+                "channel": "websocket",
+                "status": status_label,
+                "model_name": params.model_name,
+                "processing_mode": params.processing_mode,
+                "processing_time": processing_time,
+                "pre_infer_time": None,
+                "infer_time": None,
+                "post_infer_time": None,
+                "input_size_bytes": input_size_bytes,
+                "output_size_bytes": output_size_bytes,
+                "cpu_percent": cpu_percent,
+                "process_mem_mb": process_mem_mb,
+                "gpu_mem_allocated_mb": gpu_mem_allocated_mb,
+                "gpu_mem_reserved_mb": gpu_mem_reserved_mb,
+                "start_ts": start_time,
+                "end_ts": time.time(),
+                "error_message": err_msg,
+            })
+
         try:
             if params.processing_mode == "local":
                 result_data, img_mode = await processing_service.enhance_image_local(
@@ -922,7 +1161,6 @@ async def enhance_image_stream(websocket: WebSocket):
             processing_time = time.time() - start_time
 
             # 计算网络与资源指标（与 HTTP 接口字段保持一致）
-            input_size_bytes = len(image_data) if image_data is not None else 0
             output_size_bytes = len(result_data) if result_data is not None else 0
 
             # 时间拆分（WebSocket 下没有精确的 server_recv/send 概念，这里仅返回总处理时间）
@@ -969,14 +1207,19 @@ async def enhance_image_stream(websocket: WebSocket):
                 "gpu_mem_reserved_mb": round(gpu_mem_reserved_mb, 2) if gpu_mem_reserved_mb is not None else None,
                 "image_mode": img_mode or "RGB"
             })
+            record_metrics("success")
 
         except asyncio.CancelledError:
             # 任务被取消
             processing_service._clear_gpu_cache()
+            processing_time = time.time() - start_time
+            status = "cancelled"
+            error_message = "处理已取消，内存已清理"
             await websocket.send_json({
                 "type": "cancelled",
                 "message": "处理已取消，内存已清理"
             })
+            record_metrics("cancelled", error_message)
         finally:
             # 取消接收任务
             receive_task.cancel()
@@ -995,6 +1238,8 @@ async def enhance_image_stream(websocket: WebSocket):
             del task_cancelled[task_id]
         processing_service._clear_gpu_cache()
     except Exception as e:
+        if 'record_metrics' in locals():
+            record_metrics("error", str(e))
         try:
             await websocket.send_json({
                 "type": "error",
