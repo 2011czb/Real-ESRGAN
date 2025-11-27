@@ -60,6 +60,14 @@ def parse_args() -> argparse.Namespace:
         default=[".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"],
         help="扫描目录时允许的图像扩展名",
     )
+    parser.add_argument(
+        "--max-size",
+        type=int,
+        default=None,
+        help="最大图像尺寸（宽度或高度）。超过此尺寸的图像会被下采样以加速计算。默认不限制。"
+        "影响说明：PSNR/SSIM对分辨率较敏感，建议使用2048或更大；LPIPS是感知指标，1024通常足够。"
+        "建议值：512(最快，仅LPIPS)、1024(快速，LPIPS为主)、2048(平衡，推荐)、4096(高精度)",
+    )
     return parser.parse_args()
 
 
@@ -121,11 +129,38 @@ def _resize_image(img: np.ndarray, target_hw: Tuple[int, int]) -> np.ndarray:
     return resized.astype(np.float32)
 
 
+def _resize_to_max_size(img: np.ndarray, max_size: int) -> np.ndarray:
+    """将图像下采样到最大尺寸，保持宽高比"""
+    h, w = img.shape[:2]
+    if max(h, w) <= max_size:
+        return img
+
+    if h > w:
+        new_h = max_size
+        new_w = int(w * max_size / h)
+    else:
+        new_w = max_size
+        new_h = int(h * max_size / w)
+
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized.astype(np.float32)
+
+
 def align_shapes(
     ref: np.ndarray,
     test: np.ndarray,
     name: str,
+    max_size: int = None,
 ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    # 如果指定了最大尺寸，先对两个图像进行下采样
+    if max_size is not None:
+        ref_original_hw = ref.shape[:2]
+        test_original_hw = test.shape[:2]
+        ref = _resize_to_max_size(ref, max_size)
+        test = _resize_to_max_size(test, max_size)
+        if ref.shape[:2] != ref_original_hw or test.shape[:2] != test_original_hw:
+            print(f"[信息] '{name}': 已将图像下采样到最大尺寸 {max_size} (参考: {ref_original_hw} -> {ref.shape[:2]}, 处理后: {test_original_hw} -> {test.shape[:2]})")
+
     if ref.shape == test.shape:
         return ref, test, ref.shape[:2]
 
@@ -173,6 +208,7 @@ def compute_metrics(
     pairs: List[Tuple[str, Path, Path]],
     metrics: Sequence[str],
     device_choice: str,
+    max_size: int = None,
 ) -> Tuple[List[Dict[str, float]], Dict[str, float]]:
     results: List[Dict[str, float]] = []
     if device_choice == "auto":
@@ -193,7 +229,7 @@ def compute_metrics(
     for name, ref_path, test_path in pairs:
         ref = load_image(ref_path)
         test = load_image(test_path)
-        ref, test, _ = align_shapes(ref, test, name)
+        ref, test, _ = align_shapes(ref, test, name, max_size)
 
         # 使用英文键名存储数据，便于后续计算平均值
         entry: Dict[str, float] = {"image": name}
@@ -231,12 +267,12 @@ def compute_metrics(
 
 def write_csv(output_path: Path, rows: List[Dict[str, float]], aggregates: Dict[str, float], metrics: Sequence[str]) -> None:
     os.makedirs(output_path.parent, exist_ok=True)
-    
+
     # 创建中文表头映射
     metric_headers = {
         "image": "图像文件名",
         "psnr": "PSNR",
-        "ssim": "SSIM", 
+        "ssim": "SSIM",
         "lpips": "LPIPS"
     }
     fieldnames = ["图像文件名"] + [metric_headers.get(m.lower(), m.upper()) for m in metrics]
@@ -265,7 +301,7 @@ def write_csv(output_path: Path, rows: List[Dict[str, float]], aggregates: Dict[
 def main():
     args = parse_args()
     pairs = build_pairs(args.before, args.after, args.recursive, args.extensions)
-    rows, aggregates = compute_metrics(pairs, args.metrics, args.device)
+    rows, aggregates = compute_metrics(pairs, args.metrics, args.device, args.max_size)
     write_csv(args.output, rows, aggregates, args.metrics)
 
 
